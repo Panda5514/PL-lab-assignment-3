@@ -1,0 +1,13 @@
+# Rust/Cargo artifacts
+/target/
+**/*.rs.bk
+
+# Makefile build outputs
+test/*.s
+test/*.run
+runtime/*.o
+runtime/*.a
+
+# OS-specific files
+.DS_Store
+Thumbs.db

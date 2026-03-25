@@ -8,10 +8,10 @@ use std::collections::HashMap;
 // --- Task 1: Complete AST with Extensions ---
 #[derive(Debug, Clone)]
 pub enum Expr {
-    Num(i64, usize),        // Changed to i64 to handle large constants for overflow testing
+    Num(i64, usize),
     Bool(bool, usize),      
     Var(String, usize),     
-    Input(i32, usize),      // Extension: Multiple Inputs 
+    Input(i32, usize),
     Let(Vec<(String, Expr)>, Box<Expr>, usize),
     UnOp(UnOp, Box<Expr>, usize),
     BinOp(BinOp, Box<Expr>, Box<Expr>, usize),
@@ -20,7 +20,7 @@ pub enum Expr {
     Loop(Box<Expr>, usize),
     Break(Box<Expr>, usize),
     Set(String, Box<Expr>, usize),
-    Print(Box<Expr>, usize), // Extension: Print Statement 
+    Print(Box<Expr>, usize), 
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +37,7 @@ fn new_label(label_counter: &mut i32, name: &str) -> String {
 // --- Task 1 & Extension: Parser with Line Numbers ---
 fn parse_expr(s: &Sexp, line: usize) -> Expr {
     match s {
-        Sexp::Atom(I(n)) => Expr::Num(*n, line), // Sexp::Atom(I) is already i64
+        Sexp::Atom(I(n)) => Expr::Num(*n, line),
         Sexp::Atom(S(id)) if id == "true" => Expr::Bool(true, line),
         Sexp::Atom(S(id)) if id == "false" => Expr::Bool(false, line),
         Sexp::Atom(S(id)) if id == "input" => Expr::Input(0, line),
@@ -97,16 +97,29 @@ fn parse_expr(s: &Sexp, line: usize) -> Expr {
 // --- Tasks 2-7 & Extensions: Code Generation ---
 fn compile_expr(expr: &Expr, env: &HashMap<String, i32>, stack_offset: i32, label_counter: &mut i32, break_target: &Option<String>) -> String {
     match expr {
-        // Tagged Representation: Numbers shifted left by 1 [cite: 1, 11]
         Expr::Num(n, _) => format!("mov rax, {}", *n << 1),
-        // Booleans: true = 3, false = 1 [cite: 1, 12, 13]
         Expr::Bool(b, _) => format!("mov rax, {}", if *b { 3 } else { 1 }),
-        Expr::Input(idx, _) => format!("mov rax, [rdi + {}]", idx * 8), 
+        Expr::Input(idx, _) => format!("mov rax, [r15 + {}]", idx * 8), // Uses r15 now 
         Expr::Var(name, line) => {
             let offset = env.get(name).expect(&format!("Line {}: Unbound variable {}", line, name));
-            format!("mov rax, [rsp {}]", offset)
+            format!("mov rax, [rbp{}]", offset)
         }
         
+        // FIXED: Missing let instruction support!
+        Expr::Let(bindings, body, _) => {
+            let mut instrs = Vec::new();
+            let mut new_env = env.clone();
+            let mut current_offset = stack_offset;
+            for (name, val) in bindings {
+                instrs.push(compile_expr(val, &new_env, current_offset, label_counter, break_target));
+                instrs.push(format!("  mov [rbp{}], rax", current_offset));
+                new_env.insert(name.clone(), current_offset);
+                current_offset -= 8;
+            }
+            instrs.push(compile_expr(body, &new_env, current_offset, label_counter, break_target));
+            instrs.join("\n")
+        }
+
         Expr::Print(e, _) => {
             let e_code = compile_expr(e, env, stack_offset, label_counter, break_target);
             format!("{}\n  mov rdi, rax\n  call snek_print", e_code)
@@ -126,11 +139,9 @@ fn compile_expr(expr: &Expr, env: &HashMap<String, i32>, stack_offset: i32, labe
         Expr::BinOp(op, l, r, _) => {
             let l_code = compile_expr(l, env, stack_offset, label_counter, break_target);
             let r_code = compile_expr(r, env, stack_offset - 8, label_counter, break_target);
-            // Task 4: Runtime Type Checking [cite: 2, 25, 26]
             let check_nums = "  mov rcx, rax\n  or rcx, rbx\n  test rcx, 1\n  jnz error_invalid_argument";
-            
             let op_asm = match op {
-                BinOp::Plus => "add rax, rbx\n  jo error_overflow".to_string(), // Extension: Overflow 
+                BinOp::Plus => "add rax, rbx\n  jo error_overflow".to_string(), 
                 BinOp::Minus => "sub rbx, rax\n  mov rax, rbx\n  jo error_overflow".to_string(),
                 BinOp::Times => "sar rax, 1\n  imul rax, rbx\n  jo error_overflow".to_string(),
                 BinOp::Equal => "xor rax, rbx\n  test rax, 1\n  jnz error_invalid_argument\n  test rax, rax\n  setz al\n  movzx rax, al\n  shl rax, 1\n  or rax, 1".to_string(),
@@ -139,10 +150,10 @@ fn compile_expr(expr: &Expr, env: &HashMap<String, i32>, stack_offset: i32, labe
                     format!("cmp rbx, rax\n  set{} al\n  movzx rax, al\n  shl rax, 1\n  or rax, 1", cc)
                 }
             };
-            format!("{}\n  mov [rsp {}], rax\n{}\n  mov rbx, [rsp {}]\n{}\n  {}", l_code, stack_offset, r_code, stack_offset, if *op != BinOp::Equal { check_nums } else { "" }, op_asm)
+            format!("{}\n  mov [rbp{}], rax\n{}\n  mov rbx, [rbp{}]\n{}\n  {}", l_code, stack_offset, r_code, stack_offset, if *op != BinOp::Equal { check_nums } else { "" }, op_asm)
         }
 
-        Expr::If(c, t, e, _) => { // Task 3: If [cite: 8, 11, 19, 21]
+        Expr::If(c, t, e, _) => {
             let (l_else, l_end) = (new_label(label_counter, "else"), new_label(label_counter, "end"));
             format!("{}\n  cmp rax, 1\n  je {}\n{}\n  jmp {}\n{}:\n{}\n{}:", 
                 compile_expr(c, env, stack_offset, label_counter, break_target), l_else,
@@ -150,16 +161,16 @@ fn compile_expr(expr: &Expr, env: &HashMap<String, i32>, stack_offset: i32, labe
                 compile_expr(e, env, stack_offset, label_counter, break_target), l_end)
         }
 
-        Expr::Loop(b, _) => { // Task 5: Loop [cite: 8, 27, 28]
+        Expr::Loop(b, _) => {
             let (l_start, l_end) = (new_label(label_counter, "loop"), new_label(label_counter, "break"));
             format!("{}:\n  {}\n  jmp {}\n{}:", l_start, compile_expr(b, env, stack_offset, label_counter, &Some(l_end.clone())), l_start, l_end)
         }
 
         Expr::Break(e, _) => format!("{}\n  jmp {}", compile_expr(e, env, stack_offset, label_counter, break_target), break_target.as_ref().expect("Break outside loop")),
         
-        Expr::Set(name, val, _) => { // Task 1 & Extension: Mutation [cite: 9, 31]
+        Expr::Set(name, val, _) => {
             let off = env.get(name).expect("Unbound var");
-            format!("{}\n  mov [rsp {}], rax", compile_expr(val, env, stack_offset, label_counter, break_target), off)
+            format!("{}\n  mov [rbp{}], rax", compile_expr(val, env, stack_offset, label_counter, break_target), off)
         }
 
         Expr::Block(es, _) => es.iter().map(|e| compile_expr(e, env, stack_offset, label_counter, break_target)).collect::<Vec<_>>().join("\n  "),
@@ -172,8 +183,11 @@ fn main() -> std::io::Result<()> {
     File::open(&args[1])?.read_to_string(&mut input)?;
     let expr = parse_expr(&parse(&input).expect("Parse error"), 1);
     let mut counter = 0;
-    let code = compile_expr(&expr, &HashMap::new(), -8, &mut counter, &None);
     
+    // Stack_offset adjusted to start deeper. -8 and -16 used by pushed r15 and rbx
+    let code = compile_expr(&expr, &HashMap::new(), -24, &mut counter, &None); 
+    
+    // Added ABI safe execution block
     let asm = format!("
 section .text
 extern snek_error, snek_print
@@ -181,11 +195,26 @@ global our_code_starts_here
 our_code_starts_here:
   push rbp
   mov rbp, rsp
+  push r15
+  push rbx
+  mov r15, rdi       ; save input array pointer to callee-saved register
+  sub rsp, 8192      ; pre-allocate safely down to prevent call clobbering locals
   {}
+  add rsp, 8192      ; cleanup
+  pop rbx
+  pop r15
   mov rsp, rbp
   pop rbp
   ret
-error_invalid_argument: mov rdi, 1\n  call snek_error
-error_overflow: mov rdi, 2\n  call snek_error", code);
+error_invalid_argument: 
+  mov rdi, 1
+  push rsp
+  and rsp, -16       ; Ensures 16 byte stack alignment required by C ABI
+  call snek_error
+error_overflow: 
+  mov rdi, 2
+  push rsp
+  and rsp, -16
+  call snek_error", code);
     File::create(&args[2])?.write_all(asm.as_bytes())
 }
